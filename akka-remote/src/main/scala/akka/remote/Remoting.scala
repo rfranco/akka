@@ -617,7 +617,7 @@ private[remote] class EndpointManager(conf: Config, log: LoggingAdapter) extends
       case Some(endpoint) ⇒
         pendingReadHandoffs.get(endpoint) foreach (_.disassociate())
         pendingReadHandoffs += endpoint -> handle
-        endpoint ! EndpointWriter.TakeOver(handle)
+        endpoint ! EndpointWriter.TakeOver(handle, self)
       case None ⇒
         if (endpoints.isQuarantined(handle.remoteAddress, handle.handshakeInfo.uid))
           handle.disassociate(AssociationHandle.Quarantined)
@@ -628,7 +628,7 @@ private[remote] class EndpointManager(conf: Config, log: LoggingAdapter) extends
             if (handle.handshakeInfo.uid == uid) {
               pendingReadHandoffs.get(ep) foreach (_.disassociate())
               pendingReadHandoffs += ep -> handle
-              ep ! EndpointWriter.StopReading(ep)
+              ep ! EndpointWriter.StopReading(ep, self)
             } else {
               context.stop(ep)
               endpoints.unregisterEndpoint(ep)

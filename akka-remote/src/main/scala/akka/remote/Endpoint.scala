@@ -25,6 +25,7 @@ import java.util.concurrent.ConcurrentHashMap
 import scala.annotation.tailrec
 import scala.concurrent.duration.{ Duration, Deadline }
 import scala.util.control.NonFatal
+import scala.collection.mutable
 
 /**
  * INTERNAL API
@@ -315,7 +316,8 @@ private[remote] class ReliableDeliverySupervisor(
       uid = Some(receivedUid)
       resendAll()
 
-    case s: EndpointWriter.StopReading ⇒ writer forward s
+    case s: EndpointWriter.StopReading ⇒
+      writer forward s
   }
 
   def gated: Receive = {
@@ -338,8 +340,9 @@ private[remote] class ReliableDeliverySupervisor(
     case s @ Send(msg: SystemMessage, _, _, _) ⇒ tryBuffer(s.copy(seqOpt = Some(nextSeq())))
     case s: Send                               ⇒ context.system.deadLetters ! s
     case EndpointWriter.FlushAndStop           ⇒ context.stop(self)
-    case EndpointWriter.StopReading(w)         ⇒ sender() ! EndpointWriter.StoppedReading(w)
-    case _                                     ⇒ // Ignore
+    case EndpointWriter.StopReading(w, replyTo) ⇒
+      replyTo ! EndpointWriter.StoppedReading(w)
+      sender() ! EndpointWriter.StoppedReading(w)
   }
 
   def idle: Receive = {
@@ -352,8 +355,9 @@ private[remote] class ReliableDeliverySupervisor(
       writer = createWriter()
       // Resending will be triggered by the incoming GotUid message after the connection finished
       context.become(receive)
-    case EndpointWriter.FlushAndStop   ⇒ context.stop(self)
-    case EndpointWriter.StopReading(w) ⇒ sender() ! EndpointWriter.StoppedReading(w)
+    case EndpointWriter.FlushAndStop ⇒ context.stop(self)
+    case EndpointWriter.StopReading(w, replyTo) ⇒
+      replyTo ! EndpointWriter.StoppedReading(w)
   }
 
   def flushWait: Receive = {
@@ -452,25 +456,24 @@ private[remote] object EndpointWriter {
    * used instead.
    * @param handle Handle of the new inbound association.
    */
-  final case class TakeOver(handle: AkkaProtocolHandle) extends NoSerializationVerificationNeeded
+  final case class TakeOver(handle: AkkaProtocolHandle, replyTo: ActorRef) extends NoSerializationVerificationNeeded
   final case class TookOver(writer: ActorRef, handle: AkkaProtocolHandle) extends NoSerializationVerificationNeeded
   case object BackoffTimer
   case object FlushAndStop
+  private case object FlushAndStop2
   case object AckIdleCheckTimer
-  final case class StopReading(writer: ActorRef)
+  final case class StopReading(writer: ActorRef, replyTo: ActorRef)
   final case class StoppedReading(writer: ActorRef)
 
   final case class Handle(handle: AkkaProtocolHandle) extends NoSerializationVerificationNeeded
 
   final case class OutboundAck(ack: Ack)
 
-  sealed trait State
-  case object Initializing extends State
-  case object Buffering extends State
-  case object Writing extends State
-  case object Handoff extends State
+  // FIXME do we need to make these configurable?
+  private val LargeBufferLogInterval = 1000000000L // 1 s, in nanoseconds
+  private val LargeBufferLimit = 10000
+  private val SendBufferBatchSize = 5
 
-  val AckIdleTimerName = "AckIdleTimer"
 }
 
 /**
@@ -486,8 +489,7 @@ private[remote] class EndpointWriter(
   codec: AkkaPduCodec,
   val receiveBuffers: ConcurrentHashMap[Link, ResendState],
   val reliableDeliverySupervisor: Option[ActorRef])
-  extends EndpointActor(localAddress, remoteAddress, transport, settings, codec) with UnboundedStash
-  with FSM[EndpointWriter.State, Unit] {
+  extends EndpointActor(localAddress, remoteAddress, transport, settings, codec) {
 
   import EndpointWriter._
   import context.dispatcher
@@ -496,7 +498,7 @@ private[remote] class EndpointWriter(
   val remoteMetrics = RemoteMetricsExtension(extendedSystem)
 
   var reader: Option[ActorRef] = None
-  var handle: Option[AkkaProtocolHandle] = handleOrActive // FIXME: refactor into state data
+  var handle: Option[AkkaProtocolHandle] = handleOrActive
   val readerId = Iterator from 0
 
   def newAckDeadline: Deadline = Deadline.now + settings.SysMsgAckTimeout
@@ -511,8 +513,14 @@ private[remote] class EndpointWriter(
   val provider = RARP(extendedSystem).provider
   val msgDispatch = new DefaultMessageDispatcher(extendedSystem, provider, log)
 
-  var inbound = handle.isDefined
+  val inbound = handle.isDefined
   var stopReason: DisassociateInfo = AssociationHandle.Unknown
+
+  // Use an internal buffer instead of Stash for efficiency
+  // stash/unstashAll is not slow when many messages are stashed
+  // IMPORTANT: sender is not stored, so sender() and forward must not be used in EndpointWriter
+  var buffer = mutable.Buffer[Any]()
+  var largeBufferLogTimestamp = System.nanoTime()
 
   private def publishAndThrow(reason: Throwable, logLevel: Logging.LogLevel): Nothing = {
     reason match {
@@ -522,180 +530,222 @@ private[remote] class EndpointWriter(
     throw reason
   }
 
-  private def logAndStay(reason: Throwable): State = {
-    log.error(reason, "Transient association error (association remains live)")
-    stay()
-  }
-
-  override def postRestart(reason: Throwable): Unit = {
-    handle = None // Wipe out the possibly injected handle
-    inbound = false
-    preStart()
+  val ackIdleTimer = {
+    val interval = settings.SysMsgAckTimeout / 2
+    context.system.scheduler.schedule(interval, interval, self, AckIdleCheckTimer)
   }
 
   override def preStart(): Unit = {
-
-    setTimer(AckIdleTimerName, AckIdleCheckTimer, settings.SysMsgAckTimeout / 2, repeat = true)
-
-    startWith(
-      handle match {
-        case Some(h) ⇒
-          reader = startReadEndpoint(h)
-          Writing
-        case None ⇒
-          transport.associate(remoteAddress, refuseUid).map(Handle(_)) pipeTo self
-          Initializing
-      },
-      stateData = ())
+    handle match {
+      case Some(h) ⇒
+        reader = startReadEndpoint(h)
+      case None ⇒
+        transport.associate(remoteAddress, refuseUid).map(Handle(_)) pipeTo self
+    }
   }
 
-  when(Initializing) {
-    case Event(Send(msg, senderOption, recipient, _), _) ⇒
-      stash()
-      stay()
-    case Event(Status.Failure(e: InvalidAssociationException), _) ⇒
+  override def postRestart(reason: Throwable): Unit =
+    throw new IllegalStateException("EndpointWriter must not be restarted")
+
+  override def postStop(): Unit = {
+    ackIdleTimer.cancel()
+    buffer.foreach { extendedSystem.deadLetters ! _ }
+    handle foreach { _.disassociate(stopReason) }
+    eventPublisher.notifyListeners(DisassociatedEvent(localAddress, remoteAddress, inbound))
+  }
+
+  def receive = if (handle.isEmpty) initializing else writing
+
+  def initializing: Receive = {
+    case s: Send ⇒
+      buffer :+= s
+    case Status.Failure(e: InvalidAssociationException) ⇒
       publishAndThrow(new InvalidAssociation(localAddress, remoteAddress, e), Logging.WarningLevel)
-    case Event(Status.Failure(e), _) ⇒
+    case Status.Failure(e) ⇒
       publishAndThrow(new EndpointAssociationException(s"Association failed with [$remoteAddress]", e), Logging.DebugLevel)
-    case Event(Handle(inboundHandle), _) ⇒
+    case Handle(inboundHandle) ⇒
       // Assert handle == None?
       context.parent ! ReliableDeliverySupervisor.GotUid(inboundHandle.handshakeInfo.uid)
       handle = Some(inboundHandle)
       reader = startReadEndpoint(inboundHandle)
-      goto(Writing)
-
+      eventPublisher.notifyListeners(AssociatedEvent(localAddress, remoteAddress, inbound))
+      becomeWritingOrSendBufferedMessages()
   }
 
-  when(Buffering) {
-    case Event(_: Send, _) ⇒
-      stash()
-      stay()
-
-    case Event(BackoffTimer, _) ⇒ goto(Writing)
-
-    case Event(FlushAndStop, _) ⇒
-      stash() // Flushing is postponed after the pending writes
-      stay()
+  val buffering: Receive = {
+    case s: Send      ⇒ buffer append s
+    case BackoffTimer ⇒ sendBufferedMessages()
+    case FlushAndStop ⇒
+      // Flushing is postponed after the pending writes
+      buffer append FlushAndStop
+      context.system.scheduler.scheduleOnce(settings.FlushWait, self, FlushAndStop2)
+    case FlushAndStop2 ⇒
+      // enough
+      flushAndStop()
   }
 
-  when(Writing) {
-    case Event(s @ Send(msg, senderOption, recipient, seqOption), _) ⇒
-      try {
-        handle match {
-          case Some(h) ⇒
-            if (provider.remoteSettings.LogSend) {
-              def msgLog = s"RemoteMessage: [$msg] to [$recipient]<+[${recipient.path}] from [${senderOption.getOrElse(extendedSystem.deadLetters)}]"
-              log.debug("sending message {}", msgLog)
-            }
+  def becomeWritingOrSendBufferedMessages(): Unit =
+    if (buffer.isEmpty)
+      context.become(writing)
+    else {
+      context.become(buffering)
+      sendBufferedMessages()
+    }
 
-            val pdu = codec.constructMessage(
-              recipient.localAddressToUse,
-              recipient,
-              serializeMessage(msg),
-              senderOption,
-              seqOption = seqOption,
-              ackOption = lastAck)
+  def sendBufferedMessages(): Unit = {
 
-            ackDeadline = newAckDeadline
-            lastAck = None
+    def delegate(msg: Any): Boolean = msg match {
+      case s: Send ⇒
+        writeSend(s)
+      case FlushAndStop ⇒
+        flushAndStop()
+        false
+      case s @ StopReading(_, replyTo) ⇒
+        reader.foreach(_.tell(s, replyTo))
+        true
+    }
 
-            val pduSize = pdu.size
-            remoteMetrics.logPayloadBytes(msg, pduSize)
+    @tailrec def writeLoop(count: Int, remaining: Int, iter: Iterator[Any]): Int = {
+      if (count <= SendBufferBatchSize && iter.hasNext && delegate(iter.next()))
+        writeLoop(count + 1, remaining - 1, iter)
+      else
+        remaining
+    }
 
-            if (pduSize > transport.maximumPayloadBytes) {
-              logAndStay(new OversizedPayloadException(s"Discarding oversized payload sent to ${recipient}: max allowed size ${transport.maximumPayloadBytes} bytes, actual size of encoded ${msg.getClass} was ${pdu.size} bytes."))
-            } else if (h.write(pdu)) {
-              stay()
-            } else {
-              if (seqOption.isEmpty) stash()
-              goto(Buffering)
-            }
-          case None ⇒
-            throw new EndpointException("Internal error: Endpoint is in state Writing, but no association handle is present.")
+    val size = buffer.size
+    if (size > LargeBufferLimit) {
+      val now = System.nanoTime()
+      if (now - largeBufferLogTimestamp >= LargeBufferLogInterval) {
+        log.warning("[{}] buffered messages in EndpointWriter for [{}]. " +
+          "You should probably implement flow control to avoid flooding the remote connection.",
+          size, remoteAddress)
+        largeBufferLogTimestamp = now
+      }
+    }
+
+    val remaining = writeLoop(1, size, buffer.iterator)
+    if (remaining == 0) {
+      buffer.clear()
+      context.become(writing)
+    } else {
+      if (remaining != size)
+        buffer = buffer.drop(size - remaining) // drop is faster than remove
+      if (size - remaining == SendBufferBatchSize)
+        self ! BackoffTimer
+      else
+        scheduleBackoffTimer()
+    }
+  }
+
+  def scheduleBackoffTimer(): Unit =
+    context.system.scheduler.scheduleOnce(settings.BackoffPeriod, self, BackoffTimer)
+
+  val writing: Receive = {
+    case s: Send ⇒
+      if (!writeSend(s)) {
+        if (s.seqOpt.isEmpty) buffer append s
+        scheduleBackoffTimer()
+        context.become(buffering)
+      }
+
+    // We are in Writing state, so buffer is empty, safe to stop here
+    case FlushAndStop ⇒
+      flushAndStop()
+
+    case AckIdleCheckTimer if ackDeadline.isOverdue() ⇒
+      trySendPureAck()
+  }
+
+  def writeSend(s: Send): Boolean = try {
+    handle match {
+      case Some(h) ⇒
+        if (provider.remoteSettings.LogSend) {
+          def msgLog = s"RemoteMessage: [${s.message}] to [${s.recipient}]<+[${s.recipient.path}] from [${s.senderOption.getOrElse(extendedSystem.deadLetters)}]"
+          log.debug("sending message {}", msgLog)
         }
-      } catch {
-        case e: NotSerializableException ⇒
-          logAndStay(e)
-        case e: EndpointException ⇒
-          publishAndThrow(e, Logging.ErrorLevel)
-        case NonFatal(e) ⇒
-          publishAndThrow(new EndpointException("Failed to write message to the transport", e), Logging.ErrorLevel)
-      }
 
-    // We are in Writing state, so stash is empty, safe to stop here
-    case Event(FlushAndStop, _) ⇒
-      // Try to send a last Ack message
-      trySendPureAck()
-      stopReason = AssociationHandle.Shutdown
-      stop()
+        val pdu = codec.constructMessage(
+          s.recipient.localAddressToUse,
+          s.recipient,
+          serializeMessage(s.message),
+          s.senderOption,
+          seqOption = s.seqOpt,
+          ackOption = lastAck)
 
-    case Event(AckIdleCheckTimer, _) if ackDeadline.isOverdue() ⇒
-      trySendPureAck()
-      stay()
+        ackDeadline = newAckDeadline
+        lastAck = None
+
+        val pduSize = pdu.size
+        remoteMetrics.logPayloadBytes(s.message, pduSize)
+
+        if (pduSize > transport.maximumPayloadBytes) {
+          val reason = new OversizedPayloadException(s"Discarding oversized payload sent to ${s.recipient}: max allowed size ${transport.maximumPayloadBytes} bytes, actual size of encoded ${s.message.getClass} was ${pdu.size} bytes.")
+          log.error(reason, "Transient association error (association remains live)")
+          true
+        } else
+          h.write(pdu)
+
+      case None ⇒
+        throw new EndpointException("Internal error: Endpoint is in state Writing, but no association handle is present.")
+    }
+  } catch {
+    case e: NotSerializableException ⇒
+      log.error(e, "Transient association error (association remains live)")
+      true
+    case e: EndpointException ⇒
+      publishAndThrow(e, Logging.ErrorLevel)
+    case NonFatal(e) ⇒
+      publishAndThrow(new EndpointException("Failed to write message to the transport", e), Logging.ErrorLevel)
   }
 
-  when(Handoff) {
-    case Event(Terminated(_), _) ⇒
+  def handoff: Receive = {
+    case Terminated(_) ⇒
       reader = startReadEndpoint(handle.get)
-      unstashAll()
-      goto(Writing)
+      becomeWritingOrSendBufferedMessages()
 
-    case _ ⇒
-      stash()
-      stay()
-
+    case s: Send ⇒
+      buffer append s
   }
 
-  whenUnhandled {
-    case Event(Terminated(r), _) if r == reader.orNull ⇒
+  override def unhandled(message: Any): Unit = message match {
+    case Terminated(r) if r == reader.orNull ⇒
       publishAndThrow(new EndpointDisassociatedException("Disassociated"), Logging.DebugLevel)
-    case Event(s: StopReading, _) ⇒
+    case s @ StopReading(_, replyTo) ⇒
       reader match {
-        case Some(r) ⇒ r forward s
-        case None    ⇒ stash()
+        case Some(r) ⇒
+          r.tell(s, replyTo)
+        case None ⇒
+          // initalizing, buffer and take care of it later when buffer is sent
+          buffer :+= s
       }
-      stay()
-    case Event(TakeOver(newHandle), _) ⇒
+    case TakeOver(newHandle, replyTo) ⇒
       // Shutdown old reader
       handle foreach { _.disassociate() }
       handle = Some(newHandle)
-      sender() ! TookOver(self, newHandle)
-      goto(Handoff)
-    case Event(FlushAndStop, _) ⇒
+      replyTo ! TookOver(self, newHandle)
+      context.become(handoff)
+    case FlushAndStop ⇒
       stopReason = AssociationHandle.Shutdown
-      stop()
-    case Event(OutboundAck(ack), _) ⇒
+      context.stop(self)
+    case OutboundAck(ack) ⇒
       lastAck = Some(ack)
-      stay()
-    case Event(AckIdleCheckTimer, _) ⇒ stay() // Ignore
+    case AckIdleCheckTimer ⇒ // Ignore
+    case FlushAndStop2     ⇒ // ignore
   }
 
-  onTransition {
-    case Initializing -> Writing ⇒
-      unstashAll()
-      eventPublisher.notifyListeners(AssociatedEvent(localAddress, remoteAddress, inbound))
-    case Writing -> Buffering ⇒
-      setTimer("backoff-timer", BackoffTimer, settings.BackoffPeriod, repeat = false)
-    case Buffering -> Writing ⇒
-      unstashAll()
-      cancelTimer("backoff-timer")
+  def flushAndStop(): Unit = {
+    // Try to send a last Ack message
+    trySendPureAck()
+    stopReason = AssociationHandle.Shutdown
+    context.stop(self)
   }
 
-  onTermination {
-    case StopEvent(_, _, _) ⇒
-      cancelTimer(AckIdleTimerName)
-      // It is important to call unstashAll() for the stash to work properly and maintain messages during restart.
-      // As the FSM trait does not call super.postStop(), this call is needed
-      unstashAll()
-      handle foreach { _.disassociate(stopReason) }
-      eventPublisher.notifyListeners(DisassociatedEvent(localAddress, remoteAddress, inbound))
-  }
-
-  private def trySendPureAck(): Unit = for (h ← handle; ack ← lastAck)
-    if (h.write(codec.constructPureAck(ack))) {
-      ackDeadline = newAckDeadline
-      lastAck = None
-    }
+  private def trySendPureAck(): Unit =
+    for (h ← handle; ack ← lastAck)
+      if (h.write(codec.constructPureAck(ack))) {
+        ackDeadline = newAckDeadline
+        lastAck = None
+      }
 
   private def startReadEndpoint(handle: AkkaProtocolHandle): Some[ActorRef] = {
     val newReader =
@@ -812,18 +862,18 @@ private[remote] class EndpointReader(
         s"max allowed size [${transport.maximumPayloadBytes}] bytes, actual size [${oversized.size}] bytes."),
         "Transient error while reading from association (association remains live)")
 
-    case StopReading(writer) ⇒
+    case StopReading(writer, replyTo) ⇒
       saveState()
       context.become(notReading)
-      sender() ! StoppedReading(writer)
+      replyTo ! StoppedReading(writer)
 
   }
 
   def notReading: Receive = {
     case Disassociated(info) ⇒ handleDisassociated(info)
 
-    case StopReading(writer) ⇒
-      sender() ! StoppedReading(writer)
+    case StopReading(writer, replyTo) ⇒
+      replyTo ! StoppedReading(writer)
 
     case InboundPayload(p) ⇒
       val (ackOption, _) = tryDecodeMessageAndAck(p)
