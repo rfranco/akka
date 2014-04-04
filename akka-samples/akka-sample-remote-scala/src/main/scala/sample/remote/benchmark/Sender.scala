@@ -19,12 +19,13 @@ object Sender {
     val remotePath = s"akka.tcp://Sys@$remoteHostPort/user/rcv"
     val totalMessages = if (args.length >= 2) args(1).toInt else 500000
     val burstSize = if (args.length >= 3) args(2).toInt else 20000
+    val payloadSize = if (args.length >= 4) args(3).toInt else 300
 
-    system.actorOf(Sender.props(remotePath, totalMessages, burstSize), "snd")
+    system.actorOf(Sender.props(remotePath, totalMessages, burstSize, payloadSize), "snd")
   }
 
-  def props(path: String, totalMessages: Int, burstSize: Int): Props =
-    Props(new Sender(path, totalMessages, burstSize))
+  def props(path: String, totalMessages: Int, burstSize: Int, payloadSize: Int): Props =
+    Props(new Sender(path, totalMessages, burstSize, payloadSize))
 
   private case object Warmup
   sealed trait Echo
@@ -34,10 +35,10 @@ object Sender {
     extends Echo
 }
 
-class Sender(path: String, totalMessages: Int, burstSize: Int) extends Actor {
+class Sender(path: String, totalMessages: Int, burstSize: Int, payloadSize: Int) extends Actor {
   import Sender._
 
-  val payload = "abc".getBytes
+  val payload: Array[Byte] = Vector.fill(payloadSize)("a").mkString.getBytes
   var startTime = 0L
   var maxRoundTripMillis = 0L
 
@@ -66,7 +67,7 @@ class Sender(path: String, totalMessages: Int, burstSize: Int) extends Actor {
       actor ! Start
 
     case Start =>
-      println(s"Starting benchmark of $totalMessages messages with burst size $burstSize")
+      println(s"Starting benchmark of $totalMessages messages with burst size $burstSize and payload size $payloadSize")
       startTime = System.nanoTime
       sendBatch(actor, totalMessages)
       if (totalMessages <= burstSize)
@@ -97,7 +98,8 @@ class Sender(path: String, totalMessages: Int, burstSize: Int) extends Actor {
       val took = (System.nanoTime - startTime).nanos.toMillis
       val throughtput = (totalMessages * 1000.0 / took).toInt
       println(s"== It took $took ms to deliver $totalMessages messages, throughtput $throughtput msg/s, " +
-        s"max round-trip $maxRoundTripMillis ms, burst size $burstSize")
+        s"max round-trip $maxRoundTripMillis ms, burst size $burstSize, " +
+        s"payload size $payloadSize")
       context.system.shutdown()
 
     case Terminated(`actor`) =>
