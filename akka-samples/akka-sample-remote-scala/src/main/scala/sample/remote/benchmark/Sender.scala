@@ -28,6 +28,7 @@ object Sender {
     Props(new Sender(path, totalMessages, burstSize, payloadSize))
 
   private case object Warmup
+  case object Shutdown
   sealed trait Echo
   case object Start extends Echo
   case object Done extends Echo
@@ -100,6 +101,7 @@ class Sender(path: String, totalMessages: Int, burstSize: Int, payloadSize: Int)
       println(s"== It took $took ms to deliver $totalMessages messages, throughtput $throughtput msg/s, " +
         s"max round-trip $maxRoundTripMillis ms, burst size $burstSize, " +
         s"payload size $payloadSize")
+      actor ! Shutdown
       context.system.shutdown()
 
     case Terminated(`actor`) =>

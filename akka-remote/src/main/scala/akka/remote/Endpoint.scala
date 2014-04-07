@@ -25,7 +25,6 @@ import java.util.concurrent.ConcurrentHashMap
 import scala.annotation.tailrec
 import scala.concurrent.duration.{ Duration, Deadline }
 import scala.util.control.NonFatal
-import scala.collection.mutable
 
 /**
  * INTERNAL API
@@ -519,7 +518,7 @@ private[remote] class EndpointWriter(
   // Use an internal buffer instead of Stash for efficiency
   // stash/unstashAll is not slow when many messages are stashed
   // IMPORTANT: sender is not stored, so sender() and forward must not be used in EndpointWriter
-  var buffer = mutable.Buffer[Any]()
+  val buffer = new java.util.LinkedList[AnyRef]
   var largeBufferLogTimestamp = System.nanoTime()
 
   private def publishAndThrow(reason: Throwable, logLevel: Logging.LogLevel): Nothing = {
@@ -549,7 +548,8 @@ private[remote] class EndpointWriter(
 
   override def postStop(): Unit = {
     ackIdleTimer.cancel()
-    buffer.foreach { extendedSystem.deadLetters ! _ }
+    while (!buffer.isEmpty)
+      extendedSystem.deadLetters ! buffer.poll
     handle foreach { _.disassociate(stopReason) }
     eventPublisher.notifyListeners(DisassociatedEvent(localAddress, remoteAddress, inbound))
   }
@@ -558,7 +558,7 @@ private[remote] class EndpointWriter(
 
   def initializing: Receive = {
     case s: Send ⇒
-      buffer :+= s
+      buffer offer s
     case Status.Failure(e: InvalidAssociationException) ⇒
       publishAndThrow(new InvalidAssociation(localAddress, remoteAddress, e), Logging.WarningLevel)
     case Status.Failure(e) ⇒
@@ -573,11 +573,11 @@ private[remote] class EndpointWriter(
   }
 
   val buffering: Receive = {
-    case s: Send      ⇒ buffer append s
+    case s: Send      ⇒ buffer offer s
     case BackoffTimer ⇒ sendBufferedMessages()
     case FlushAndStop ⇒
       // Flushing is postponed after the pending writes
-      buffer append FlushAndStop
+      buffer offer FlushAndStop
       context.system.scheduler.scheduleOnce(settings.FlushWait, self, FlushAndStop2)
     case FlushAndStop2 ⇒
       // enough
@@ -605,12 +605,13 @@ private[remote] class EndpointWriter(
         true
     }
 
-    @tailrec def writeLoop(count: Int, remaining: Int, iter: Iterator[Any]): Int = {
-      if (count <= SendBufferBatchSize && iter.hasNext && delegate(iter.next()))
-        writeLoop(count + 1, remaining - 1, iter)
-      else
-        remaining
-    }
+    @tailrec def writeLoop(count: Int): Boolean =
+      if (count <= SendBufferBatchSize && !buffer.isEmpty)
+        if (delegate(buffer.peek)) {
+          buffer.removeFirst()
+          writeLoop(count + 1)
+        } else false
+      else true
 
     val size = buffer.size
     if (size > LargeBufferLimit) {
@@ -623,18 +624,14 @@ private[remote] class EndpointWriter(
       }
     }
 
-    val remaining = writeLoop(1, size, buffer.iterator)
-    if (remaining == 0) {
-      buffer.clear()
+    val ok = writeLoop(1)
+    if (buffer.isEmpty)
       context.become(writing)
-    } else {
-      if (remaining != size)
-        buffer = buffer.drop(size - remaining) // drop is faster than remove
-      if (size - remaining == SendBufferBatchSize)
-        self ! BackoffTimer
-      else
-        scheduleBackoffTimer()
-    }
+    else if (ok)
+      self ! BackoffTimer
+    else
+      scheduleBackoffTimer()
+
   }
 
   def scheduleBackoffTimer(): Unit =
@@ -643,7 +640,7 @@ private[remote] class EndpointWriter(
   val writing: Receive = {
     case s: Send ⇒
       if (!writeSend(s)) {
-        if (s.seqOpt.isEmpty) buffer append s
+        if (s.seqOpt.isEmpty) buffer offer s
         scheduleBackoffTimer()
         context.become(buffering)
       }
@@ -704,7 +701,7 @@ private[remote] class EndpointWriter(
       becomeWritingOrSendBufferedMessages()
 
     case s: Send ⇒
-      buffer append s
+      buffer offer s
   }
 
   override def unhandled(message: Any): Unit = message match {
@@ -716,7 +713,7 @@ private[remote] class EndpointWriter(
           r.tell(s, replyTo)
         case None ⇒
           // initalizing, buffer and take care of it later when buffer is sent
-          buffer :+= s
+          buffer offer s
       }
     case TakeOver(newHandle, replyTo) ⇒
       // Shutdown old reader
