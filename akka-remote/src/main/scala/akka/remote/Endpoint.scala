@@ -25,6 +25,9 @@ import java.util.concurrent.ConcurrentHashMap
 import scala.annotation.tailrec
 import scala.concurrent.duration.{ Duration, Deadline }
 import scala.util.control.NonFatal
+import java.util.concurrent.locks.LockSupport
+import scala.concurrent.Future
+import scala.concurrent.blocking
 
 /**
  * INTERNAL API
@@ -468,10 +471,12 @@ private[remote] object EndpointWriter {
 
   final case class OutboundAck(ack: Ack)
 
-  // FIXME do we need to make these configurable?
-  private val LargeBufferLogInterval = 1000000000L // 1 s, in nanoseconds
-  private val LargeBufferLimit = 10000
+  private val LargeBufferLogInterval = 5000000000L // 5 s, in nanoseconds
+  private val LargeBufferLimit = 100000 // FIXME make this configurable
   private val SendBufferBatchSize = 5
+  private val MinAdaptiveBackoffNanos = 300000L // 0.3 ms
+  private val MaxAdaptiveBackoffNanos = 2000000L // 2 ms
+  private val MaxWriteCount = 50
 
 }
 
@@ -592,6 +597,29 @@ private[remote] class EndpointWriter(
       sendBufferedMessages()
     }
 
+  var writeCount = 0
+  var maxWriteCount = MaxWriteCount
+  var adaptiveBackoffNanos = 1000000L // 1 ms
+  var fullBackoff = false
+
+  // FIXME remove these counters when tuning/testing is completed
+  var fullBackoffCount = 1
+  var smallBackoffCount = 0
+  var noBackoffCount = 0
+
+  def adjustAdaptiveBackup(): Unit = {
+    maxWriteCount = math.max(writeCount, maxWriteCount)
+    if (writeCount <= SendBufferBatchSize) {
+      fullBackoff = true
+      adaptiveBackoffNanos = math.min((adaptiveBackoffNanos * 1.2).toLong, MaxAdaptiveBackoffNanos)
+    } else if (writeCount >= maxWriteCount * 0.6)
+      adaptiveBackoffNanos = math.max((adaptiveBackoffNanos * 0.9).toLong, MinAdaptiveBackoffNanos)
+    else if (writeCount <= maxWriteCount * 0.2)
+      adaptiveBackoffNanos = math.min((adaptiveBackoffNanos * 1.1).toLong, MaxAdaptiveBackoffNanos)
+
+    writeCount = 0
+  }
+
   def sendBufferedMessages(): Unit = {
 
     def delegate(msg: Any): Boolean = msg match {
@@ -609,33 +637,66 @@ private[remote] class EndpointWriter(
       if (count <= SendBufferBatchSize && !buffer.isEmpty)
         if (delegate(buffer.peek)) {
           buffer.removeFirst()
+          writeCount += 1
           writeLoop(count + 1)
         } else false
       else true
 
     val size = buffer.size
-    if (size > LargeBufferLimit) {
-      val now = System.nanoTime()
-      if (now - largeBufferLogTimestamp >= LargeBufferLogInterval) {
-        log.warning("[{}] buffered messages in EndpointWriter for [{}]. " +
-          "You should probably implement flow control to avoid flooding the remote connection.",
-          size, remoteAddress)
-        largeBufferLogTimestamp = now
-      }
-    }
 
     val ok = writeLoop(1)
-    if (buffer.isEmpty)
+    if (buffer.isEmpty) {
+      // FIXME remove this when testing/tuning is completed
+      println(s"# Drained buffer with maxWriteCount: $maxWriteCount, fullBackoffCount: $fullBackoffCount" +
+        s", smallBackoffCount: $smallBackoffCount, noBackoffCount: $noBackoffCount " +
+        s", adaptiveBackoff: ${adaptiveBackoffNanos / 1000}")
+      fullBackoffCount = 1
+      smallBackoffCount = 0
+      noBackoffCount = 0
+
+      writeCount = 0
+      maxWriteCount = MaxWriteCount
       context.become(writing)
-    else if (ok)
+    } else if (ok) {
+      noBackoffCount += 1
       self ! BackoffTimer
-    else
+    } else {
+
+      if (size > LargeBufferLimit) {
+        val now = System.nanoTime()
+        if (now - largeBufferLogTimestamp >= LargeBufferLogInterval) {
+          log.warning("[{}] buffered messages in EndpointWriter for [{}]. " +
+            "You should probably implement flow control to avoid flooding the remote connection.",
+            size, remoteAddress)
+          largeBufferLogTimestamp = now
+        }
+      }
+
+      adjustAdaptiveBackup()
       scheduleBackoffTimer()
+    }
 
   }
 
-  def scheduleBackoffTimer(): Unit =
-    context.system.scheduler.scheduleOnce(settings.BackoffPeriod, self, BackoffTimer)
+  def scheduleBackoffTimer(): Unit = {
+    if (fullBackoff) {
+      fullBackoffCount += 1
+      fullBackoff = false
+      context.system.scheduler.scheduleOnce(settings.BackoffPeriod, self, BackoffTimer)
+    } else {
+      smallBackoffCount += 1
+      val s = self
+      val backoffNanos = adaptiveBackoffNanos
+      Future {
+        // FIXME Is there a better way to backoff 0.3 - 2 ms?
+        //       Should we use a dedicated dispatcher for this?
+        blocking {
+          LockSupport.parkNanos(backoffNanos)
+          s.tell(BackoffTimer, ActorRef.noSender)
+        }
+      }
+    }
+  }
 
   val writing: Receive = {
     case s: Send ⇒
@@ -728,6 +789,8 @@ private[remote] class EndpointWriter(
       lastAck = Some(ack)
     case AckIdleCheckTimer ⇒ // Ignore
     case FlushAndStop2     ⇒ // ignore
+    case BackoffTimer      ⇒ // ignore
+    case other             ⇒ super.unhandled(other)
   }
 
   def flushAndStop(): Unit = {

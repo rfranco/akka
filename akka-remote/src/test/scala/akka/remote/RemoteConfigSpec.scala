@@ -35,7 +35,7 @@ class RemoteConfigSpec extends AkkaSpec(
       RetryGateClosedFor should be(5 seconds)
       Dispatcher should be("akka.remote.default-remote-dispatcher")
       UsePassiveConnections should be(true)
-      BackoffPeriod should be(10 millis)
+      BackoffPeriod should be(5 millis)
       SysMsgAckTimeout should be(0.3 seconds)
       SysResendTimeout should be(2 seconds)
       SysMsgBufferSize should be(1000)

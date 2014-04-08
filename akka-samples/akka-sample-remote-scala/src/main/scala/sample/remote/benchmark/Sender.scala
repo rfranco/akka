@@ -18,8 +18,8 @@ object Sender {
     val remoteHostPort = if (args.length >= 1) args(0) else "127.0.0.1:2553"
     val remotePath = s"akka.tcp://Sys@$remoteHostPort/user/rcv"
     val totalMessages = if (args.length >= 2) args(1).toInt else 500000
-    val burstSize = if (args.length >= 3) args(2).toInt else 20000
-    val payloadSize = if (args.length >= 4) args(3).toInt else 300
+    val burstSize = if (args.length >= 3) args(2).toInt else 5000
+    val payloadSize = if (args.length >= 4) args(3).toInt else 100
 
     system.actorOf(Sender.props(remotePath, totalMessages, burstSize, payloadSize), "snd")
   }
@@ -102,12 +102,11 @@ class Sender(path: String, totalMessages: Int, burstSize: Int, payloadSize: Int)
         s"max round-trip $maxRoundTripMillis ms, burst size $burstSize, " +
         s"payload size $payloadSize")
       actor ! Shutdown
-      context.system.shutdown()
 
     case Terminated(`actor`) =>
       println("Receiver terminated")
-      sendIdentifyRequest()
-      context.become(identifying)
+      context.system.shutdown()
+
     case ReceiveTimeout =>
     // ignore
 
