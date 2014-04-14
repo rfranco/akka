@@ -462,7 +462,7 @@ private[remote] object EndpointWriter {
   final case class TookOver(writer: ActorRef, handle: AkkaProtocolHandle) extends NoSerializationVerificationNeeded
   case object BackoffTimer
   case object FlushAndStop
-  private case object FlushAndStop2
+  private case object FlushAndStopTimeout
   case object AckIdleCheckTimer
   final case class StopReading(writer: ActorRef, replyTo: ActorRef)
   final case class StoppedReading(writer: ActorRef)
@@ -471,11 +471,11 @@ private[remote] object EndpointWriter {
 
   final case class OutboundAck(ack: Ack)
 
-  private val LargeBufferLogInterval = 5000000000L // 5 s, in nanoseconds
-  private val LargeBufferLimit = 100000 // FIXME make this configurable
+  // These settings are not configurable because wrong configuration will break the auto-tuning 
   private val SendBufferBatchSize = 5
   private val MinAdaptiveBackoffNanos = 300000L // 0.3 ms
   private val MaxAdaptiveBackoffNanos = 2000000L // 2 ms
+  private val LogBufferSizeInterval = 5000000000L // 5 s, in nanoseconds
   private val MaxWriteCount = 50
 
 }
@@ -500,6 +500,7 @@ private[remote] class EndpointWriter(
 
   val extendedSystem: ExtendedActorSystem = context.system.asInstanceOf[ExtendedActorSystem]
   val remoteMetrics = RemoteMetricsExtension(extendedSystem)
+  lazy val backoffDispatcher = context.system.dispatchers.lookup("akka.remote.backoff-remote-dispatcher")
 
   var reader: Option[ActorRef] = None
   var handle: Option[AkkaProtocolHandle] = handleOrActive
@@ -521,9 +522,10 @@ private[remote] class EndpointWriter(
   var stopReason: DisassociateInfo = AssociationHandle.Unknown
 
   // Use an internal buffer instead of Stash for efficiency
-  // stash/unstashAll is not slow when many messages are stashed
+  // stash/unstashAll is slow when many messages are stashed
   // IMPORTANT: sender is not stored, so sender() and forward must not be used in EndpointWriter
   val buffer = new java.util.LinkedList[AnyRef]
+  val prioBuffer = new java.util.LinkedList[Send]
   var largeBufferLogTimestamp = System.nanoTime()
 
   private def publishAndThrow(reason: Throwable, logLevel: Logging.LogLevel): Nothing = {
@@ -553,6 +555,8 @@ private[remote] class EndpointWriter(
 
   override def postStop(): Unit = {
     ackIdleTimer.cancel()
+    while (!prioBuffer.isEmpty)
+      extendedSystem.deadLetters ! prioBuffer.poll
     while (!buffer.isEmpty)
       extendedSystem.deadLetters ! buffer.poll
     handle foreach { _.disassociate(stopReason) }
@@ -563,7 +567,7 @@ private[remote] class EndpointWriter(
 
   def initializing: Receive = {
     case s: Send ⇒
-      buffer offer s
+      enqueueInBuffer(s)
     case Status.Failure(e: InvalidAssociationException) ⇒
       publishAndThrow(new InvalidAssociation(localAddress, remoteAddress, e), Logging.WarningLevel)
     case Status.Failure(e) ⇒
@@ -577,14 +581,20 @@ private[remote] class EndpointWriter(
       becomeWritingOrSendBufferedMessages()
   }
 
+  def enqueueInBuffer(msg: AnyRef): Unit = msg match {
+    case s @ Send(_: PriorityMessage, _, _, _) ⇒ prioBuffer offer s
+    case s @ Send(ActorSelectionMessage(_: PriorityMessage, _), _, _, _) ⇒ prioBuffer offer s
+    case _ ⇒ buffer offer msg
+  }
+
   val buffering: Receive = {
-    case s: Send      ⇒ buffer offer s
+    case s: Send      ⇒ enqueueInBuffer(s)
     case BackoffTimer ⇒ sendBufferedMessages()
     case FlushAndStop ⇒
       // Flushing is postponed after the pending writes
       buffer offer FlushAndStop
-      context.system.scheduler.scheduleOnce(settings.FlushWait, self, FlushAndStop2)
-    case FlushAndStop2 ⇒
+      context.system.scheduler.scheduleOnce(settings.FlushWait, self, FlushAndStopTimeout)
+    case FlushAndStopTimeout ⇒
       // enough
       flushAndStop()
   }
@@ -642,14 +652,24 @@ private[remote] class EndpointWriter(
         } else false
       else true
 
+    @tailrec def writePrioLoop(): Boolean =
+      if (prioBuffer.isEmpty) true
+      else {
+        if (writeSend(prioBuffer.peek)) {
+          prioBuffer.removeFirst()
+          writePrioLoop()
+        } else false
+      }
+
     val size = buffer.size
 
-    val ok = writeLoop(1)
-    if (buffer.isEmpty) {
+    val ok = writePrioLoop() && writeLoop(1)
+    if (buffer.isEmpty && prioBuffer.isEmpty) {
       // FIXME remove this when testing/tuning is completed
-      println(s"# Drained buffer with maxWriteCount: $maxWriteCount, fullBackoffCount: $fullBackoffCount" +
-        s", smallBackoffCount: $smallBackoffCount, noBackoffCount: $noBackoffCount " +
-        s", adaptiveBackoff: ${adaptiveBackoffNanos / 1000}")
+      if (log.isDebugEnabled)
+        log.debug(s"Drained buffer with maxWriteCount: $maxWriteCount, fullBackoffCount: $fullBackoffCount" +
+          s", smallBackoffCount: $smallBackoffCount, noBackoffCount: $noBackoffCount " +
+          s", adaptiveBackoff: ${adaptiveBackoffNanos / 1000}")
       fullBackoffCount = 1
       smallBackoffCount = 0
       noBackoffCount = 0
@@ -662,9 +682,9 @@ private[remote] class EndpointWriter(
       self ! BackoffTimer
     } else {
 
-      if (size > LargeBufferLimit) {
+      if (size > settings.LogBufferSizeExceeding) {
         val now = System.nanoTime()
-        if (now - largeBufferLogTimestamp >= LargeBufferLogInterval) {
+        if (now - largeBufferLogTimestamp >= LogBufferSizeInterval) {
           log.warning("[{}] buffered messages in EndpointWriter for [{}]. " +
             "You should probably implement flow control to avoid flooding the remote connection.",
             size, remoteAddress)
@@ -688,20 +708,16 @@ private[remote] class EndpointWriter(
       val s = self
       val backoffNanos = adaptiveBackoffNanos
       Future {
-        // FIXME Is there a better way to backoff 0.3 - 2 ms?
-        //       Should we use a dedicated dispatcher for this?
-        blocking {
-          LockSupport.parkNanos(backoffNanos)
-          s.tell(BackoffTimer, ActorRef.noSender)
-        }
-      }
+        LockSupport.parkNanos(backoffNanos)
+        s.tell(BackoffTimer, ActorRef.noSender)
+      }(backoffDispatcher)
     }
   }
 
   val writing: Receive = {
     case s: Send ⇒
       if (!writeSend(s)) {
-        if (s.seqOpt.isEmpty) buffer offer s
+        if (s.seqOpt.isEmpty) enqueueInBuffer(s)
         scheduleBackoffTimer()
         context.become(buffering)
       }
@@ -762,7 +778,7 @@ private[remote] class EndpointWriter(
       becomeWritingOrSendBufferedMessages()
 
     case s: Send ⇒
-      buffer offer s
+      enqueueInBuffer(s)
   }
 
   override def unhandled(message: Any): Unit = message match {
@@ -774,7 +790,7 @@ private[remote] class EndpointWriter(
           r.tell(s, replyTo)
         case None ⇒
           // initalizing, buffer and take care of it later when buffer is sent
-          buffer offer s
+          enqueueInBuffer(s)
       }
     case TakeOver(newHandle, replyTo) ⇒
       // Shutdown old reader
@@ -787,10 +803,10 @@ private[remote] class EndpointWriter(
       context.stop(self)
     case OutboundAck(ack) ⇒
       lastAck = Some(ack)
-    case AckIdleCheckTimer ⇒ // Ignore
-    case FlushAndStop2     ⇒ // ignore
-    case BackoffTimer      ⇒ // ignore
-    case other             ⇒ super.unhandled(other)
+    case AckIdleCheckTimer   ⇒ // Ignore
+    case FlushAndStopTimeout ⇒ // ignore
+    case BackoffTimer        ⇒ // ignore
+    case other               ⇒ super.unhandled(other)
   }
 
   def flushAndStop(): Unit = {

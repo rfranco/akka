@@ -49,6 +49,14 @@ private[remote] object RARP extends ExtensionId[RARP] with ExtensionIdProvider {
 
 /**
  * INTERNAL API
+ * Messages marked with this trait will be sent before other messages when buffering is active.
+ * This means that these messages don't obey normal message ordering.
+ * It is used for failure detector heartbeat messages.
+ */
+private[akka] trait PriorityMessage
+
+/**
+ * INTERNAL API
  */
 private[remote] object Remoting {
 
